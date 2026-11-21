@@ -107,13 +107,26 @@ airspy_source_c::airspy_source_c (const std::string &args)
   // osmocom Source block usage: Device arguments:  airspy=0x644064DC317C1FCD
   // if no device arguments are given or s/n=0, the first found airspy device will be used
   // use airspy_info utility to identify device serial number strings
+  //
+  // A serial that does not parse is an error rather than a silent "first
+  // device": on a box with two sticks that can be the one another source
+  // wanted. With no serial ("airspy" or "airspy=") the first device is opened.
   uint64_t sn = 0;
-  std::stringstream ss;
-  ss << std::hex << dict["airspy"];
-  ss >> sn;
-  std::cerr << "Attempting to open airspy by s/n= "
-            <<  boost::format("0x%016X") % (sn) << std::endl;
-  ret = airspy_open_sn( &_dev, sn );
+  dict_t::const_iterator sn_arg = dict.find("airspy");
+  if (sn_arg != dict.end() && !sn_arg->second.empty()) {
+    std::istringstream ss(sn_arg->second);
+    ss >> std::hex >> sn;
+    if (ss.fail() || !(ss >> std::ws).eof())
+      throw std::runtime_error("airspy: cannot parse serial number '" + sn_arg->second + "'");
+  }
+  if (sn != 0) {
+    std::cerr << "Attempting to open airspy by s/n= "
+              <<  boost::format("0x%016X") % (sn) << std::endl;
+    ret = airspy_open_sn( &_dev, sn );
+  } else {
+    std::cerr << "Attempting to open the first airspy (no s/n given)" << std::endl;
+    ret = airspy_open( &_dev );
+  }
   AIRSPY_THROW_ON_ERROR(ret, "Failed to open AirSpy device")
 
   uint8_t board_id;
