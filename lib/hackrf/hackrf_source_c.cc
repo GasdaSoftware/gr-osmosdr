@@ -67,7 +67,8 @@ hackrf_source_c::hackrf_source_c (const std::string &args)
     hackrf_common::hackrf_common(args),
     _buf(NULL),
     _lna_gain(0),
-    _vga_gain(0)
+    _vga_gain(0),
+    _drops(args)
 {
   dict_t dict = params_to_dict(args);
 
@@ -143,6 +144,13 @@ int hackrf_source_c::_hackrf_rx_callback(hackrf_transfer *transfer)
 
 int hackrf_source_c::hackrf_rx_callback(unsigned char *buf, uint32_t len)
 {
+  /* len is valid_length in bytes, 2 bytes (8-bit I + Q) per complex sample;
+   * work() consumes _buf_len bytes per slot, so a short buffer is flagged. */
+  const uint64_t nsamples = len / BYTES_PER_SAMPLE;
+  _drops.buffer_arrived(nsamples);
+  if (len < _buf_len)
+    _drops.short_buffer();
+
   {
     std::lock_guard<std::mutex> lock(_buf_mutex);
 
@@ -150,9 +158,12 @@ int hackrf_source_c::hackrf_rx_callback(unsigned char *buf, uint32_t len)
     memcpy(_buf[buf_tail], buf, len);
 
     if (_buf_used == _buf_num) {
+      /* Ring full: the oldest unread slot was overwritten. */
+      _drops.fifo_dropped(nsamples);
       std::cerr << "O" << std::flush;
       _buf_head = (_buf_head + 1) % _buf_num;
     } else {
+      _drops.delivered(nsamples);
       _buf_used++;
     }
   }
@@ -168,6 +179,7 @@ bool hackrf_source_c::start()
     return false;
 
   hackrf_common::start();
+  _drops.streaming_started(get_sample_rate());
   int ret = hackrf_start_rx( _dev.get(), _hackrf_rx_callback, (void *)this );
   if ( ret != HACKRF_SUCCESS ) {
     std::cerr << "Failed to start RX streaming (" << ret << ")" << std::endl;
@@ -217,6 +229,8 @@ int hackrf_source_c::work( int noutput_items,
 
   if ( ! running )
     return WORK_DONE;
+
+  _drops.maybe_report();
 
   const uint8_t *buf = _buf[_buf_head] + _buf_offset * BYTES_PER_SAMPLE;
 #define TO_COMPLEX(p) gr_complex( _lut[(p)[0]], _lut[(p)[1]] )

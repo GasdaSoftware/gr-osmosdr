@@ -29,6 +29,7 @@
 #include <libhackrf/hackrf.h>
 
 #include "source_iface.h"
+#include "fn_drop_stats.h"
 #include "hackrf_common.h"
 
 class hackrf_source_c;
@@ -138,6 +139,8 @@ private:
 
   double _lna_gain;
   double _vga_gain;
+  /* Keep last: destroyed first, after the destructor body stopped streaming. */
+  osmosdr_fn::drop_counter _drops;
 };
 
 #endif /* INCLUDED_HACKRF_SOURCE_C_H */

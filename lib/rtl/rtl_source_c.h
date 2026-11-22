@@ -30,6 +30,7 @@
 #include <condition_variable>
 
 #include "source_iface.h"
+#include "fn_drop_stats.h"
 
 class rtl_source_c;
 typedef struct rtlsdr_dev rtlsdr_dev_t;
@@ -143,6 +144,8 @@ private:
   bool _auto_gain;
   double _if_gain;
   unsigned int _skipped;
+  /* Keep last: destroyed first, after the destructor body stopped streaming. */
+  osmosdr_fn::drop_counter _drops;
 };
 
 #endif /* INCLUDED_RTLSDR_SOURCE_C_H */

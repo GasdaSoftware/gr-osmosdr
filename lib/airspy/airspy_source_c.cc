@@ -93,7 +93,8 @@ airspy_source_c::airspy_source_c (const std::string &args)
     _lna_gain(0),
     _mix_gain(0),
     _vga_gain(0),
-    _bandwidth(0)
+    _bandwidth(0),
+    _drops(args)
 {
 
   int ret;
@@ -241,6 +242,13 @@ int airspy_source_c::_airspy_rx_callback(airspy_transfer *transfer)
 {
   airspy_source_c *obj = (airspy_source_c *)transfer->ctx;
 
+  /* gr-osmosdr leaves libairspy at its default AIRSPY_SAMPLE_FLOAT32_IQ, so
+   * sample_count is complex samples, and dropped_samples (dropped USB
+   * buffers x sample_count, reported with the next buffer that got through)
+   * is in the same unit. */
+  obj->_drops.lib_dropped(transfer->dropped_samples);
+  obj->_drops.buffer_arrived(transfer->sample_count);
+
   return obj->airspy_rx_callback((float *)transfer->samples, transfer->sample_count);
 }
 
@@ -271,9 +279,13 @@ int airspy_source_c::airspy_rx_callback(void *samples, int sample_count)
     _samp_avail.notify_one();
   }
 
+  _drops.delivered(to_copy);
+
   /* Indicate overrun, if neccesary */
-  if (to_copy < num_samples)
+  if (to_copy < num_samples) {
+    _drops.fifo_dropped(num_samples - to_copy);
     std::cerr << "O" << std::flush;
+  }
 
   return 0; // TODO: return -1 on error/stop
 }
@@ -282,6 +294,8 @@ bool airspy_source_c::start()
 {
   if ( ! _dev )
     return false;
+
+  _drops.streaming_started(_sample_rate);
 
   int ret = airspy_start_rx( _dev, _airspy_rx_callback, (void *)this );
   if ( ret != AIRSPY_SUCCESS ) {
@@ -319,6 +333,8 @@ int airspy_source_c::work( int noutput_items,
 
   if ( ! running )
     return WORK_DONE;
+
+  _drops.maybe_report();
 
   std::unique_lock<std::mutex> lock(_fifo_lock);
 

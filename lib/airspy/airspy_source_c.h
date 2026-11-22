@@ -32,6 +32,7 @@
 #include <libairspy/airspy.h>
 
 #include "source_iface.h"
+#include "fn_drop_stats.h"
 
 class airspy_source_c;
 
@@ -148,6 +149,8 @@ private:
   double _mix_gain;
   double _vga_gain;
   double _bandwidth;
+  /* Keep last: destroyed first, after the destructor body stopped streaming. */
+  osmosdr_fn::drop_counter _drops;
 };
 
 #endif /* INCLUDED_AIRSPY_SOURCE_C_H */

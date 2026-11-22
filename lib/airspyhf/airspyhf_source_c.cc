@@ -84,7 +84,8 @@ airspyhf_source_c::airspyhf_source_c (const std::string &args)
     _dev(NULL),
     _sample_rate(0),
     _center_freq(0),
-    _freq_corr(0)
+    _freq_corr(0),
+    _drops(args)
 {
   int ret;
 
@@ -167,6 +168,8 @@ int airspyhf_source_c::airspyhf_rx_callback(void *samples, int sample_count)
   size_t i, n_avail, to_copy, num_samples = sample_count;
   float *sample = (float *)samples;
 
+  _drops.buffer_arrived(num_samples);
+
   _fifo_lock.lock();
 
   n_avail = _fifo->capacity() - _fifo->size();
@@ -189,9 +192,13 @@ int airspyhf_source_c::airspyhf_rx_callback(void *samples, int sample_count)
     _samp_avail.notify_one();
   }
 
+  _drops.delivered(to_copy);
+
   /* Indicate overrun, if neccesary */
-  if (to_copy < num_samples)
+  if (to_copy < num_samples) {
+    _drops.fifo_dropped(num_samples - to_copy);
     std::cerr << "O" << std::flush;
+  }
 
   return 0; // TODO: return -1 on error/stop
 }
@@ -200,6 +207,8 @@ bool airspyhf_source_c::start()
 {
   if ( ! _dev )
     return false;
+
+  _drops.streaming_started(_sample_rate);
 
   int ret = airspyhf_start( _dev, _airspyhf_rx_callback, (void *)this );
   if ( ret != AIRSPYHF_SUCCESS ) {
@@ -237,6 +246,8 @@ int airspyhf_source_c::work( int noutput_items,
 
   if ( ! running )
     return WORK_DONE;
+
+  _drops.maybe_report();
 
   std::unique_lock<std::mutex> lock(_fifo_lock);
 

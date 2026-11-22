@@ -87,7 +87,8 @@ rtl_source_c::rtl_source_c (const std::string &args)
     _no_tuner(false),
     _auto_gain(false),
     _if_gain(0),
-    _skipped(0)
+    _skipped(0),
+    _drops(args)
 {
   int ret;
   int index;
@@ -267,6 +268,8 @@ rtl_source_c::~rtl_source_c ()
 
 bool rtl_source_c::start()
 {
+  _drops.streaming_started(get_sample_rate());
+
   _running = true;
   _thread = gr::thread::thread(_rtlsdr_wait, this);
 
@@ -296,6 +299,14 @@ void rtl_source_c::rtlsdr_callback(unsigned char *buf, uint32_t len)
     return;
   }
 
+  /* len is libusb's actual_length in bytes, 2 bytes (8-bit I + Q) per
+   * complex sample.  work() always consumes _buf_len bytes per slot, so a
+   * short transfer is worth flagging: its tail is stale data. */
+  const uint64_t nsamples = len / BYTES_PER_SAMPLE;
+  _drops.buffer_arrived(nsamples);
+  if (len < _buf_len)
+    _drops.short_buffer();
+
   {
     std::lock_guard<std::mutex> lock( _buf_mutex );
 
@@ -303,9 +314,13 @@ void rtl_source_c::rtlsdr_callback(unsigned char *buf, uint32_t len)
     memcpy(_buf[buf_tail], buf, len);
 
     if (_buf_used == _buf_num) {
+      /* Ring full: the oldest unread slot was just overwritten, so one
+       * buffer's worth is lost and the count handed on does not change. */
+      _drops.fifo_dropped(nsamples);
       std::cerr << "O" << std::flush;
       _buf_head = (_buf_head + 1) % _buf_num;
     } else {
+      _drops.delivered(nsamples);
       _buf_used++;
     }
   }
@@ -345,6 +360,8 @@ int rtl_source_c::work( int noutput_items,
 
   if (!_running)
     return WORK_DONE;
+
+  _drops.maybe_report();
 
   while (noutput_items && _buf_used) {
     const int nout = std::min(noutput_items, _samp_avail);

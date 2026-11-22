@@ -32,6 +32,7 @@ list(APPEND gr_osmosdr_srcs
     ranges.cc
     device.cc
     time_spec.cc
+    fn_drop_stats.cc
 )
 
 #-pthread Adds support for multithreading with the pthreads library.
