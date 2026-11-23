@@ -126,6 +126,7 @@ public:
 private:
   static int _airspy_rx_callback(airspy_transfer* transfer);
   int airspy_rx_callback(void *samples, int sample_count);
+  void poll_lib_capture_info();
 
   airspy_device *_dev;
 
@@ -149,6 +150,10 @@ private:
   double _mix_gain;
   double _vga_gain;
   double _bandwidth;
+  /* Gap fill (FN_SDR_GAPFILL): touched by the libairspy consumer thread in
+   * the callback, and by start() while not streaming. */
+  osmosdr_fn::gap_debt _debt;
+  int64_t _lib_poll_ns;
   /* Keep last: destroyed first, after the destructor body stopped streaming. */
   osmosdr_fn::drop_counter _drops;
 };

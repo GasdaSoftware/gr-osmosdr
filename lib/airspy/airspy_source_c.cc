@@ -36,12 +36,49 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/thread/thread.hpp>
 
+#include <chrono>
+#include <cstddef>
+#include <cstring>
+#include <dlfcn.h>
+
 #include <gnuradio/io_signature.h>
 
 #include "airspy_source_c.h"
 #include "airspy_fir_kernels.h"
 
 #include "arg_helpers.h"
+#include "fn_capture.h"
+
+/*
+ * FN libairspy extension, resolved at run time so this block still works
+ * against a stock libairspy.  Layout must match airspy_fn_capture_info_t in
+ * the FN airspy.h (fields are only ever appended; the size argument tells
+ * the library how much to fill).
+ */
+namespace {
+
+struct fn_airspy_capture_info {
+  uint32_t size;
+  int32_t  rt_status;
+  int32_t  rt_prio;
+  uint32_t queue_buffers;
+  uint32_t buffer_bytes;
+  uint32_t queue_peak;
+  uint32_t queue_used;
+  uint32_t reserved;
+  uint64_t dropped_buffers;
+};
+
+typedef int (*fn_airspy_get_capture_info_t)(airspy_device *, fn_airspy_capture_info *, size_t);
+
+fn_airspy_get_capture_info_t fn_airspy_get_capture_info()
+{
+  static const fn_airspy_get_capture_info_t f =
+    (fn_airspy_get_capture_info_t)dlsym(RTLD_DEFAULT, "airspy_fn_get_capture_info");
+  return f;
+}
+
+} // namespace
 
 using namespace boost::assign;
 
@@ -94,6 +131,7 @@ airspy_source_c::airspy_source_c (const std::string &args)
     _mix_gain(0),
     _vga_gain(0),
     _bandwidth(0),
+    _lib_poll_ns(0),
     _drops(args)
 {
 
@@ -199,7 +237,11 @@ airspy_source_c::airspy_source_c (const std::string &args)
     AIRSPY_THROW_ON_ERROR(ret, "Failed to set USB bit packing")
   }
 
-  _fifo = new boost::circular_buffer<gr_complex>(5000000);
+  const size_t fifo_samples = osmosdr_fn::config().airspy_fifo;
+  if (fifo_samples != 5000000)
+    std::cerr << "airspy: sample fifo " << fifo_samples
+              << " samples (FN_AIRSPY_FIFO_SAMPLES)" << std::endl;
+  _fifo = new boost::circular_buffer<gr_complex>(fifo_samples);
   if (!_fifo) {
     throw std::runtime_error( std::string(__FUNCTION__) + " " +
                               "Failed to allocate a sample FIFO!" );
@@ -249,6 +291,10 @@ int airspy_source_c::_airspy_rx_callback(airspy_transfer *transfer)
   obj->_drops.lib_dropped(transfer->dropped_samples);
   obj->_drops.buffer_arrived(transfer->sample_count);
 
+  /* The library dropped those buffers immediately before this one: that is
+   * where the zeros go (gap fill), ahead of this buffer's samples. */
+  obj->_debt.lost(transfer->dropped_samples);
+
   return obj->airspy_rx_callback((float *)transfer->samples, transfer->sample_count);
 }
 
@@ -260,7 +306,18 @@ int airspy_source_c::airspy_rx_callback(void *samples, int sample_count)
   _fifo_lock.lock();
 
   n_avail = _fifo->capacity() - _fifo->size();
-  to_copy = (n_avail < num_samples ? n_avail : num_samples);
+
+  /* Gap fill (see fn_gap_debt.h): zeros owed for samples lost just before
+   * this buffer go in first, together with the whole buffer; while they do
+   * not fit, the buffer joins the debt, and a debt past the cap is abandoned
+   * (upstream path).  Samples of this buffer that do not fit become the debt
+   * in front of the next buffer.  With FN_SDR_GAPFILL=0 the plan is always
+   * { 0, min(n_avail, num_samples) }, the upstream rule. */
+  const osmosdr_fn::gap_debt::plan plan = _debt.place(n_avail, num_samples);
+  to_copy = plan.data;
+
+  for (i = 0; i < plan.zeros; i++)
+    _fifo->push_back( gr_complex( 0.0f, 0.0f ) );
 
   for (i = 0; i < to_copy; i++ )
   {
@@ -274,7 +331,7 @@ int airspy_source_c::airspy_rx_callback(void *samples, int sample_count)
   _fifo_lock.unlock();
 
   /* We have made some new samples available to the consumer in work() */
-  if (to_copy) {
+  if (to_copy || plan.zeros) {
     //std::cerr << "+" << std::flush;
     _samp_avail.notify_one();
   }
@@ -287,6 +344,8 @@ int airspy_source_c::airspy_rx_callback(void *samples, int sample_count)
     std::cerr << "O" << std::flush;
   }
 
+  _drops.publish(_debt);
+
   return 0; // TODO: return -1 on error/stop
 }
 
@@ -296,6 +355,13 @@ bool airspy_source_c::start()
     return false;
 
   _drops.streaming_started(_sample_rate);
+
+  /* Not streaming yet, so the callback thread is not running. */
+  const osmosdr_fn::capture_config &cfg = osmosdr_fn::config();
+  _debt.abandon();
+  _debt.configure(cfg.gapfill, (uint64_t)(_sample_rate * cfg.gapfill_max_ms / 1000.0));
+  _drops.publish(_debt, _sample_rate);
+  _lib_poll_ns = 0;
 
   int ret = airspy_start_rx( _dev, _airspy_rx_callback, (void *)this );
   if ( ret != AIRSPY_SUCCESS ) {
@@ -335,6 +401,7 @@ int airspy_source_c::work( int noutput_items,
     return WORK_DONE;
 
   _drops.maybe_report();
+  poll_lib_capture_info();
 
   std::unique_lock<std::mutex> lock(_fifo_lock);
 
@@ -354,6 +421,30 @@ int airspy_source_c::work( int noutput_items,
   //std::cerr << "-" << std::flush;
 
   return noutput_items;
+}
+
+/* work() thread, device open: copy libairspy's capture state (scheduling of
+ * its USB thread, queue use) into the counters, at most once a second. */
+void airspy_source_c::poll_lib_capture_info()
+{
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (_lib_poll_ns != 0 && now - _lib_poll_ns < 1000000000LL)
+    return;
+  _lib_poll_ns = now;
+
+  fn_airspy_get_capture_info_t get = fn_airspy_get_capture_info();
+  if (!get || !_dev)
+    return;
+
+  fn_airspy_capture_info info;
+  std::memset(&info, 0, sizeof(info));
+  if (get(_dev, &info, sizeof(info)) != AIRSPY_SUCCESS ||
+      info.size < offsetof(fn_airspy_capture_info, queue_peak) + sizeof(info.queue_peak))
+    return;
+
+  _drops.set_rt(info.rt_status, info.rt_prio);
+  _drops.set_lib_queue(info.queue_buffers, info.queue_peak);
 }
 
 std::vector<std::string> airspy_source_c::get_devices()

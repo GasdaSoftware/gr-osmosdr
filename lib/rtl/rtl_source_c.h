@@ -129,7 +129,13 @@ private:
   rtlsdr_dev_t *_dev;
   gr::thread::thread _thread;
   unsigned char **_buf;
-  unsigned int _buf_num;
+  unsigned int _buf_num;   /* USB transfers handed to rtlsdr_read_async */
+  unsigned int _ring_num;  /* ring slots (FN_RTL_RING_BUFFERS; default _buf_num) */
+  /* Gap fill: zeros work() emits before slot i's data (under _buf_mutex). */
+  uint64_t *_ring_gap;
+  uint64_t _gap_left;      /* work() thread only */
+  bool _gap_taken;         /* work() thread only: head slot's gap already loaded */
+  osmosdr_fn::gap_debt _debt;  /* callback thread; configured in start() */
   unsigned int _buf_len;
   unsigned int _buf_head;
   unsigned int _buf_used;

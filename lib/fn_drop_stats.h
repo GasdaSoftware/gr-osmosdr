@@ -13,6 +13,7 @@
  *
  *   osmosdr_fn_drop_stats()   lib_dropped / fifo_dropped / delivered
  *   osmosdr_fn_stall_stats()  receive-callback timing (stalls, gaps)
+ *   osmosdr_fn_capture_stats() gap fill and capture-thread scheduling (FN)
  *
  * All sample counts are complex samples at the source's output rate and
  * cumulative since the source was created.
@@ -22,8 +23,11 @@
 #define OSMOSDR_FN_DROP_STATS_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+
+#include "fn_gap_debt.h"
 
 extern "C" {
 
@@ -49,6 +53,40 @@ int osmosdr_fn_drop_stats(struct osmosdr_fn_drop_stat *out, int max);
 
 __attribute__((visibility("default")))
 int osmosdr_fn_stall_stats(struct osmosdr_fn_stall_stat *out, int max);
+
+/*
+ * Gap fill and capture scheduling.  Sources are in the same order as in the
+ * two calls above (match on device as well).  Losses the block can count
+ * (lib_dropped + fifo_dropped) are either zero-filled at the point of loss,
+ * abandoned, or still owed:
+ *
+ *   lib_dropped + fifo_dropped == filled + unfilled + owed
+ *
+ * so the samples handed to the flowgraph are delivered + filled.  Losses the
+ * device itself suffered (USB thread late) are invisible and never filled.
+ *
+ * stat_size is sizeof(struct osmosdr_fn_capture_stat) as the caller was
+ * compiled; out is an array with that stride and each element receives at
+ * most that many bytes, so fields can be appended later.  Returns the number
+ * of sources (which may exceed max), or 0 on error.
+ */
+struct osmosdr_fn_capture_stat {
+  char     device[96];     /* same string as osmosdr_fn_drop_stat.device */
+  uint32_t size;           /* bytes of this struct the library filled */
+  int32_t  rt_status;      /* capture thread: 0 n/a or not reported, 1 SCHED_FIFO, 2 off (FN_SDR_RT_PRIO=0), 3 not permitted, 4 failed */
+  int32_t  rt_prio;        /* SCHED_FIFO priority obtained, 0 otherwise */
+  int32_t  gapfill;        /* 1 = zero fill on for this source (FN_SDR_GAPFILL) */
+  uint64_t filled;         /* zero samples inserted in place of counted losses */
+  uint64_t unfilled;       /* counted losses not filled: gap fill off, or debt over the cap / not placeable */
+  uint64_t owed;           /* counted losses waiting to be filled at the next buffer */
+  uint64_t gap_cap;        /* largest debt still filled, samples */
+  uint32_t queue_buffers;  /* libairspy transfer-to-consumer queue length (0 = unknown: not airspy or stock libairspy) */
+  uint32_t queue_peak;     /* most buffers waiting in that queue at once since start */
+  double   sample_rate;    /* rate gap_cap was computed from */
+};
+
+__attribute__((visibility("default")))
+int osmosdr_fn_capture_stats(struct osmosdr_fn_capture_stat *out, int max, size_t stat_size);
 
 }
 
@@ -83,8 +121,36 @@ public:
   /* work() path: prints one line per minute when something was lost. */
   void maybe_report();
 
+  /* Capture-thread scheduling (any thread). */
+  void set_rt(int status, int prio)
+  {
+    _rt_prio.store(prio, std::memory_order_relaxed);
+    _rt_status.store(status, std::memory_order_relaxed);
+  }
+  /* libairspy queue (work() thread). */
+  void set_lib_queue(uint32_t buffers, uint32_t peak)
+  {
+    _queue_buffers.store(buffers, std::memory_order_relaxed);
+    _queue_peak.store(peak, std::memory_order_relaxed);
+  }
+  /* Publish the owner's gap debt (owner's thread; atomics only). */
+  void publish(const gap_debt &d, double rate)
+  {
+    _gapfill.store(d.enabled() ? 1 : 0, std::memory_order_relaxed);
+    _gap_cap.store(d.cap(), std::memory_order_relaxed);
+    _gap_rate.store(rate, std::memory_order_relaxed);
+    publish(d);
+  }
+  void publish(const gap_debt &d)
+  {
+    _filled.store(d.filled(), std::memory_order_relaxed);
+    _unfilled.store(d.unfilled(), std::memory_order_relaxed);
+    _owed.store(d.owed(), std::memory_order_relaxed);
+  }
+
   void fill(osmosdr_fn_drop_stat &s) const;
   void fill(osmosdr_fn_stall_stat &s) const;
+  void fill(osmosdr_fn_capture_stat &s) const;
 
 private:
   char _device[96];
@@ -102,9 +168,21 @@ private:
   std::atomic<uint64_t> _max_gap_ns{0};
   std::atomic<uint64_t> _win_max_gap_ns{0};
 
+  std::atomic<int>      _rt_status{0};
+  std::atomic<int>      _rt_prio{0};
+  std::atomic<int>      _gapfill{0};
+  std::atomic<uint64_t> _filled{0};
+  std::atomic<uint64_t> _unfilled{0};
+  std::atomic<uint64_t> _owed{0};
+  std::atomic<uint64_t> _gap_cap{0};
+  std::atomic<double>   _gap_rate{0.0};
+  std::atomic<uint32_t> _queue_buffers{0};
+  std::atomic<uint32_t> _queue_peak{0};
+
   /* report state, touched only by maybe_report() (the work() thread) */
   int64_t  _rep_t0_ns;
   uint64_t _rep_lib, _rep_fifo, _rep_delivered, _rep_stalls;
+  uint64_t _rep_filled, _rep_unfilled;
 };
 
 } // namespace osmosdr_fn
