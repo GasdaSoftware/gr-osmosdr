@@ -48,7 +48,8 @@ void atomic_max(std::atomic<uint64_t> &a, uint64_t v)
 } // namespace
 
 drop_counter::drop_counter(const std::string &device_args)
-  : _rep_t0_ns(0), _rep_lib(0), _rep_fifo(0), _rep_delivered(0), _rep_stalls(0)
+  : _rep_t0_ns(0), _rep_lib(0), _rep_fifo(0), _rep_delivered(0), _rep_stalls(0),
+    _rep_filled(0), _rep_unfilled(0)
 {
   std::snprintf(_device, sizeof(_device), "%s", device_args.c_str());
 
@@ -102,6 +103,8 @@ void drop_counter::maybe_report()
     _rep_fifo = _fifo.load(std::memory_order_relaxed);
     _rep_delivered = _delivered.load(std::memory_order_relaxed);
     _rep_stalls = _stalls.load(std::memory_order_relaxed);
+    _rep_filled = _filled.load(std::memory_order_relaxed);
+    _rep_unfilled = _unfilled.load(std::memory_order_relaxed);
     return;
   }
 
@@ -113,6 +116,8 @@ void drop_counter::maybe_report()
   const uint64_t delivered = _delivered.load(std::memory_order_relaxed);
   const uint64_t stalls = _stalls.load(std::memory_order_relaxed);
   const uint64_t win_max_gap = _win_max_gap_ns.exchange(0, std::memory_order_relaxed);
+  const uint64_t filled = _filled.load(std::memory_order_relaxed);
+  const uint64_t unfilled = _unfilled.load(std::memory_order_relaxed);
 
   const uint64_t d_lib = lib - _rep_lib;
   const uint64_t d_fifo = fifo - _rep_fifo;
@@ -126,10 +131,15 @@ void drop_counter::maybe_report()
                     "; callback stalls=%llu max_gap=%.0fms",
                     (unsigned long long)d_stalls, win_max_gap / 1e6);
     /* One fprintf so the line is not interleaved with "O" markers. */
+    char fill_part[96] = "";
+    if (_gapfill.load(std::memory_order_relaxed) && (d_lib || d_fifo))
+      std::snprintf(fill_part, sizeof(fill_part), "; zero-filled=%llu unfilled=%llu",
+                    (unsigned long long)(filled - _rep_filled),
+                    (unsigned long long)(unfilled - _rep_unfilled));
     std::fprintf(stderr,
-                 "\ngr-osmosdr: %s dropped lib=%llu fifo=%llu of %llu samples in last %.0fs%s\n",
+                 "\ngr-osmosdr: %s dropped lib=%llu fifo=%llu of %llu samples in last %.0fs%s%s\n",
                  _device, (unsigned long long)d_lib, (unsigned long long)d_fifo,
-                 (unsigned long long)d_total, (now - _rep_t0_ns) / 1e9, stall_part);
+                 (unsigned long long)d_total, (now - _rep_t0_ns) / 1e9, stall_part, fill_part);
   }
 
   _rep_t0_ns = now;
@@ -137,6 +147,8 @@ void drop_counter::maybe_report()
   _rep_fifo = fifo;
   _rep_delivered = delivered;
   _rep_stalls = stalls;
+  _rep_filled = filled;
+  _rep_unfilled = unfilled;
 }
 
 void drop_counter::fill(osmosdr_fn_drop_stat &s) const
@@ -156,6 +168,25 @@ void drop_counter::fill(osmosdr_fn_stall_stat &s) const
   s.stall_ns = _stall_ns.load(std::memory_order_relaxed);
   s.max_gap_ns = _max_gap_ns.load(std::memory_order_relaxed);
   s.sample_rate = _rate.load(std::memory_order_relaxed);
+}
+
+void drop_counter::fill(osmosdr_fn_capture_stat &s) const
+{
+  std::memset(&s, 0, sizeof(s));
+  std::memcpy(s.device, _device, sizeof(s.device));
+  s.size = sizeof(s);
+  s.rt_status = _rt_status.load(std::memory_order_relaxed);
+  s.rt_prio = _rt_prio.load(std::memory_order_relaxed);
+  s.gapfill = _gapfill.load(std::memory_order_relaxed);
+  s.filled = _filled.load(std::memory_order_relaxed);
+  s.unfilled = _unfilled.load(std::memory_order_relaxed);
+  s.owed = _owed.load(std::memory_order_relaxed);
+  s.gap_cap = _gap_cap.load(std::memory_order_relaxed);
+  s.queue_buffers = _queue_buffers.load(std::memory_order_relaxed);
+  s.queue_peak = _queue_peak.load(std::memory_order_relaxed);
+  s.sample_rate = _gap_rate.load(std::memory_order_relaxed);
+  s.clip_samples = _clip.load(std::memory_order_relaxed);
+  s.clip_examined = _clip_examined.load(std::memory_order_relaxed);
 }
 
 template <typename T>
@@ -184,4 +215,28 @@ extern "C" int osmosdr_fn_drop_stats(struct osmosdr_fn_drop_stat *out, int max)
 extern "C" int osmosdr_fn_stall_stats(struct osmosdr_fn_stall_stat *out, int max)
 {
   return osmosdr_fn::fill_all(out, max);
+}
+
+extern "C" int osmosdr_fn_capture_stats(struct osmosdr_fn_capture_stat *out, int max, size_t stat_size)
+{
+  try {
+    if (out && (stat_size < sizeof(uint32_t) + sizeof(out->device)))
+      return 0;
+    osmosdr_fn::registry &r = osmosdr_fn::reg();
+    std::lock_guard<std::mutex> g(r.lock);
+    const int n = (int)r.sources.size();
+    if (out) {
+      const size_t copy = stat_size < sizeof(osmosdr_fn_capture_stat) ? stat_size : sizeof(osmosdr_fn_capture_stat);
+      char *base = reinterpret_cast<char *>(out);
+      for (int i = 0; i < n && i < max; i++) {
+        osmosdr_fn_capture_stat s;
+        r.sources[i]->fill(s);
+        s.size = (uint32_t)copy;
+        std::memcpy(base + (size_t)i * stat_size, &s, copy);
+      }
+    }
+    return n;
+  } catch (...) {
+    return 0;
+  }
 }

@@ -37,10 +37,12 @@
 #include <stdexcept>
 #include <iostream>
 #include <stdio.h>
+#include <algorithm>
 
 #include <rtl-sdr.h>
 
 #include "arg_helpers.h"
+#include "fn_capture.h"
 
 using namespace boost::assign;
 
@@ -83,6 +85,10 @@ rtl_source_c::rtl_source_c (const std::string &args)
         gr::io_signature::make(MIN_OUT, MAX_OUT, sizeof (gr_complex))),
     _dev(NULL),
     _buf(NULL),
+    _ring_num(0),
+    _ring_gap(NULL),
+    _gap_left(0),
+    _gap_taken(false),
     _running(false),
     _no_tuner(false),
     _auto_gain(false),
@@ -173,6 +179,11 @@ rtl_source_c::rtl_source_c (const std::string &args)
               << std::endl;
   }
 
+  _ring_num = osmosdr_fn::config().rtl_ring ? osmosdr_fn::config().rtl_ring : _buf_num;
+  if (_ring_num != _buf_num)
+    std::cerr << "Using a ring of " << _ring_num << " buffers for "
+              << _buf_num << " USB transfers (FN_RTL_RING_BUFFERS)." << std::endl;
+
   _samp_avail = _buf_len / BYTES_PER_SAMPLE;
 
   // create a lookup table for gr_complex values
@@ -231,12 +242,16 @@ rtl_source_c::rtl_source_c (const std::string &args)
 
   set_if_gain( 24 ); /* preset to a reasonable default (non-GRC use case) */
 
-  _buf = (unsigned char **)malloc(_buf_num * sizeof(unsigned char *));
+  _buf = (unsigned char **)malloc(_ring_num * sizeof(unsigned char *));
 
   if (_buf) {
-    for(unsigned int i = 0; i < _buf_num; ++i)
+    for(unsigned int i = 0; i < _ring_num; ++i)
       _buf[i] = (unsigned char *)malloc(_buf_len);
   }
+
+  _ring_gap = (uint64_t *)calloc(_ring_num, sizeof(uint64_t));
+  if (!_ring_gap)
+    throw std::runtime_error("Failed to allocate the ring gap table.");
 }
 
 /*
@@ -257,18 +272,35 @@ rtl_source_c::~rtl_source_c ()
   }
 
   if (_buf) {
-    for(unsigned int i = 0; i < _buf_num; ++i) {
+    for(unsigned int i = 0; i < _ring_num; ++i) {
       free(_buf[i]);
     }
 
     free(_buf);
     _buf = NULL;
   }
+
+  free(_ring_gap);
+  _ring_gap = NULL;
 }
 
 bool rtl_source_c::start()
 {
-  _drops.streaming_started(get_sample_rate());
+  const double rate = get_sample_rate();
+  _drops.streaming_started(rate);
+
+  /* The read thread is not running yet. */
+  const osmosdr_fn::capture_config &cfg = osmosdr_fn::config();
+  _debt.abandon();
+  _debt.configure(cfg.gapfill, (uint64_t)(rate * cfg.gapfill_max_ms / 1000.0));
+  {
+    std::lock_guard<std::mutex> lock( _buf_mutex );
+    for (unsigned int i = 0; i < _ring_num; ++i)
+      _ring_gap[i] = 0;
+  }
+  _gap_left = 0;
+  _gap_taken = false;
+  _drops.publish(_debt, rate);
 
   _running = true;
   _thread = gr::thread::thread(_rtlsdr_wait, this);
@@ -307,23 +339,56 @@ void rtl_source_c::rtlsdr_callback(unsigned char *buf, uint32_t len)
   if (len < _buf_len)
     _drops.short_buffer();
 
-  {
+  bool overrun = false;
+
+  if (_debt.enabled()) {
+    /* Gap fill: when the ring is full the NEWEST buffer is dropped instead
+     * of overwriting the oldest.  The same amount is lost, but the gap then
+     * sits exactly between the last stored slot and the next buffer that is
+     * stored, so work() can emit the zeros in front of that slot; it also
+     * never overwrites the slot work() may be reading.  Zeros take no ring
+     * memory but count against its capacity, so the backlog stays bounded. */
     std::lock_guard<std::mutex> lock( _buf_mutex );
 
-    int buf_tail = (_buf_head + _buf_used) % _buf_num;
+    const uint64_t slot = _buf_len / BYTES_PER_SAMPLE;
+    const uint64_t room = (uint64_t)(_ring_num - _buf_used) * slot;
+    const osmosdr_fn::gap_debt::plan plan = _debt.place(room, nsamples);
+
+    if (plan.data == nsamples) {
+      int buf_tail = (_buf_head + _buf_used) % _ring_num;
+      memcpy(_buf[buf_tail], buf, len);
+      _ring_gap[buf_tail] = plan.zeros;
+      _drops.delivered(nsamples);
+      _buf_used++;
+    } else {
+      /* Ring full: place() made this buffer the debt before the next one. */
+      _drops.fifo_dropped(nsamples);
+      overrun = true;
+    }
+  } else {
+    std::lock_guard<std::mutex> lock( _buf_mutex );
+
+    int buf_tail = (_buf_head + _buf_used) % _ring_num;
     memcpy(_buf[buf_tail], buf, len);
 
-    if (_buf_used == _buf_num) {
+    if (_buf_used == _ring_num) {
       /* Ring full: the oldest unread slot was just overwritten, so one
        * buffer's worth is lost and the count handed on does not change. */
       _drops.fifo_dropped(nsamples);
-      std::cerr << "O" << std::flush;
-      _buf_head = (_buf_head + 1) % _buf_num;
+      _debt.lost(nsamples);  /* gap fill off: counted as unfilled */
+      overrun = true;
+      _buf_head = (_buf_head + 1) % _ring_num;
     } else {
       _drops.delivered(nsamples);
       _buf_used++;
     }
   }
+
+  /* Outside the lock: a blocked stderr must not hold up work(). */
+  if (overrun)
+    std::cerr << "O" << std::flush;
+
+  _drops.publish(_debt);
 
   _buf_cond.notify_one();
 }
@@ -335,6 +400,17 @@ void rtl_source_c::_rtlsdr_wait(rtl_source_c *obj)
 
 void rtl_source_c::rtlsdr_wait()
 {
+  /* This thread runs librtlsdr's libusb event loop AND the callback (a
+   * memcpy into the ring under _buf_mutex, which work() only ever holds for
+   * O(1) bookkeeping), so it is the capture thread: ask for SCHED_FIFO. */
+  int rt_prio = 0;
+  char rt_msg[160];
+  const int rt = osmosdr_fn::rt_apply(osmosdr_fn::config().rt_prio, &rt_prio,
+                                      rt_msg, sizeof(rt_msg));
+  _drops.set_rt(rt, rt_prio);
+  std::fprintf(stderr, "gr-osmosdr: rtl capture thread %s; ring %u x %u bytes\n",
+               rt_msg, _ring_num, _buf_len);
+
   int ret = rtlsdr_read_async( _dev, _rtlsdr_callback, (void *)this, _buf_num, _buf_len );
 
   _running = false;
@@ -364,6 +440,24 @@ int rtl_source_c::work( int noutput_items,
   _drops.maybe_report();
 
   while (noutput_items && _buf_used) {
+    if (!_gap_taken) {
+      /* Starting the head slot: zeros owed in front of it go out first. */
+      if (_debt.enabled()) {
+        std::lock_guard<std::mutex> lock( _buf_mutex );
+        _gap_left = _ring_gap[_buf_head];
+        _ring_gap[_buf_head] = 0;
+      }
+      _gap_taken = true;
+    }
+    if (_gap_left) {
+      const int nz = (int)std::min<uint64_t>((uint64_t)noutput_items, _gap_left);
+      std::fill(out, out + nz, gr_complex(0.0f, 0.0f));
+      out += nz;
+      noutput_items -= nz;
+      _gap_left -= nz;
+      continue;
+    }
+
     const int nout = std::min(noutput_items, _samp_avail);
     const unsigned char *buf = _buf[_buf_head] + _buf_offset * 2;
 
@@ -377,9 +471,10 @@ int rtl_source_c::work( int noutput_items,
       {
         std::lock_guard<std::mutex> lock( _buf_mutex );
 
-        _buf_head = (_buf_head + 1) % _buf_num;
+        _buf_head = (_buf_head + 1) % _ring_num;
         _buf_used--;
       }
+      _gap_taken = false;
       _samp_avail = _buf_len / BYTES_PER_SAMPLE;
       _buf_offset = 0;
     } else {
