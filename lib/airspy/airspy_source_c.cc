@@ -67,6 +67,8 @@ struct fn_airspy_capture_info {
   uint32_t queue_used;
   uint32_t reserved;
   uint64_t dropped_buffers;
+  uint64_t clip_samples;
+  uint64_t clip_examined;
 };
 
 typedef int (*fn_airspy_get_capture_info_t)(airspy_device *, fn_airspy_capture_info *, size_t);
@@ -445,6 +447,8 @@ void airspy_source_c::poll_lib_capture_info()
 
   _drops.set_rt(info.rt_status, info.rt_prio);
   _drops.set_lib_queue(info.queue_buffers, info.queue_peak);
+  if (info.size >= offsetof(fn_airspy_capture_info, clip_examined) + sizeof(info.clip_examined))
+    _drops.set_clip(info.clip_samples, info.clip_examined);
 }
 
 std::vector<std::string> airspy_source_c::get_devices()

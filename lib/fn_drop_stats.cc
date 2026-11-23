@@ -185,6 +185,8 @@ void drop_counter::fill(osmosdr_fn_capture_stat &s) const
   s.queue_buffers = _queue_buffers.load(std::memory_order_relaxed);
   s.queue_peak = _queue_peak.load(std::memory_order_relaxed);
   s.sample_rate = _gap_rate.load(std::memory_order_relaxed);
+  s.clip_samples = _clip.load(std::memory_order_relaxed);
+  s.clip_examined = _clip_examined.load(std::memory_order_relaxed);
 }
 
 template <typename T>

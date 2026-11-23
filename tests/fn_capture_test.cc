@@ -285,6 +285,7 @@ static void test_export()
   a.publish(d, 10e6);
   a.set_rt(osmosdr_fn::RT_FIFO, 10);
   a.set_lib_queue(128, 9);
+  a.set_clip(12, 8192);
 
   /* count only */
   CHECK(osmosdr_fn_capture_stats(NULL, 0, sizeof(osmosdr_fn_capture_stat)) == 2);
@@ -298,6 +299,7 @@ static void test_export()
   CHECK(s[0].gapfill == 1 && s[0].gap_cap == 100 && s[0].sample_rate == 10e6);
   CHECK(s[0].rt_status == 1 && s[0].rt_prio == 10);
   CHECK(s[0].queue_buffers == 128 && s[0].queue_peak == 9);
+  CHECK(s[0].clip_samples == 12 && s[0].clip_examined == 8192);
   CHECK(std::string(s[1].device) == "rtl=0");
   CHECK(s[1].rt_status == 0 && s[1].filled == 0 && s[1].gapfill == 0);
 

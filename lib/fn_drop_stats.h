@@ -83,6 +83,8 @@ struct osmosdr_fn_capture_stat {
   uint32_t queue_buffers;  /* libairspy transfer-to-consumer queue length (0 = unknown: not airspy or stock libairspy) */
   uint32_t queue_peak;     /* most buffers waiting in that queue at once since start */
   double   sample_rate;    /* rate gap_cap was computed from */
+  uint64_t clip_samples;   /* ADC samples at full scale in the examined buffers (FN libairspy; 0 elsewhere) */
+  uint64_t clip_examined;  /* ADC samples examined for clipping (0 = not measured) */
 };
 
 __attribute__((visibility("default")))
@@ -133,6 +135,12 @@ public:
     _queue_buffers.store(buffers, std::memory_order_relaxed);
     _queue_peak.store(peak, std::memory_order_relaxed);
   }
+  /* libairspy ADC clip sampling (work() thread). */
+  void set_clip(uint64_t clipped, uint64_t examined)
+  {
+    _clip.store(clipped, std::memory_order_relaxed);
+    _clip_examined.store(examined, std::memory_order_relaxed);
+  }
   /* Publish the owner's gap debt (owner's thread; atomics only). */
   void publish(const gap_debt &d, double rate)
   {
@@ -178,6 +186,8 @@ private:
   std::atomic<double>   _gap_rate{0.0};
   std::atomic<uint32_t> _queue_buffers{0};
   std::atomic<uint32_t> _queue_peak{0};
+  std::atomic<uint64_t> _clip{0};
+  std::atomic<uint64_t> _clip_examined{0};
 
   /* report state, touched only by maybe_report() (the work() thread) */
   int64_t  _rep_t0_ns;
